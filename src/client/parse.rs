@@ -435,6 +435,7 @@ pub(crate) fn parse_describe(
         }
     }
     let raw_sdp = MostlyAscii(&response.body()[..]);
+    debug!("SDP: {:?}", raw_sdp);
     let sdp = sdp_types::Session::parse(raw_sdp.0)
         .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
 

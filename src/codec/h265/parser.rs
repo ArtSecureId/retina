@@ -123,9 +123,14 @@ pub enum NaluType {
     RsvNvcl45 = 45,
     RsvNvcl46 = 46,
     RsvNvcl47 = 47,
+    RsvNvcl48 = 48,
+    RsvNvcl49 = 49,
 }
 
 impl NaluType {
+    pub fn value(&self) -> u8 {
+        *self as u8
+    }
     /// Whether this is an IDR NALU.
     pub fn is_idr(&self) -> bool {
         matches!(self, Self::IdrWRadl | Self::IdrNLp)
