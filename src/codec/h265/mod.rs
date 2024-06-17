@@ -47,9 +47,11 @@ impl NalHeader {
     }
     pub fn nal_unit_type(&self) -> NaluType {
         let nal_type = (self.0 >> 9) & 0b0000_0011_1111;
+        let nalu_type = NaluType::try_from(nal_type);
+        log::info!("Received Nalu Type {:?}", nalu_type);
         match nal_type {
-            1 => NaluType::TrailN,
-            2 => NaluType::TrailR,
+            0 => NaluType::TrailN,
+            1 => NaluType::TrailR,
             32 => NaluType::VpsNut,
             33 => NaluType::SpsNut,
             34 => NaluType::PpsNut,
@@ -102,11 +104,25 @@ impl fmt::Debug for NalHeader {
 struct Nal {
     hdr: NalHeader,
 
+    // This is the byte contains the Fragment Unit if the Nalu is Fragmented
+    fu: Option<u8>,
     /// The length of `Depacketizer::pieces` as this NAL finishes.
     next_piece_idx: u32,
 
     /// The total length of this NAL, including the header byte.
     len: u32,
+}
+
+impl Nal {
+    pub fn is_fu_idr(&self) -> bool {
+        if self.fu.is_some() {
+            let fu = self.fu.unwrap();
+            let nalu_type = fu & 0b00111111;
+            nalu_type == NaluType::IdrNLp.value() || nalu_type == NaluType::IdrWRadl.value()
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -620,10 +636,11 @@ impl Depacketizer {
                         "Non-fragmented NAL {value:02x} while fragment in progress"
                     ));
                 }
-                let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
+                let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 2;
                 let next_piece_idx = self.add_piece(data)?;
                 self.nals.push(Nal {
                     hdr: nal_header,
+                    fu: None,
                     next_piece_idx,
                     len,
                 });
@@ -656,6 +673,7 @@ impl Depacketizer {
                             let next_piece_idx = self.add_piece(data)?;
                             self.nals.push(Nal {
                                 hdr,
+                                fu: None,
                                 next_piece_idx,
                                 len: u32::from(len),
                             });
@@ -667,18 +685,13 @@ impl Depacketizer {
                             let next_piece_idx = self.add_piece(piece)?;
                             self.nals.push(Nal {
                                 hdr,
+                                fu: None,
                                 next_piece_idx,
                                 len: u32::from(len),
                             });
                         }
                     }
                 }
-            }
-            25..=27 | 29 => {
-                let value = nal_header.get_value();
-                return Err(format!(
-                    "unimplemented/unexpected interleaved mode NAL ({value:02x})",
-                ));
             }
             49 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
@@ -688,6 +701,8 @@ impl Depacketizer {
                 let fu_header = data[0];
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
+                let nalu_type = fu_header & 0b00111111;
+
                 let reserved = (fu_header & 0b00100000) != 0;
                 data.advance(1);
                 if (start && end) || reserved {
@@ -703,8 +718,9 @@ impl Depacketizer {
                         self.add_piece(data)?;
                         self.nals.push(Nal {
                             hdr: nal_header,
+                            fu: Some(fu_header),
                             next_piece_idx: u32::MAX, // should be overwritten later.
-                            len: 1 + u32_len,
+                            len: 3 + u32_len,
                         });
                         access_unit.in_fu_a = true;
                     }
@@ -774,6 +790,16 @@ impl Depacketizer {
         u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
     }
 
+    //If the Nalu Type is 49 (Fragment Unit) ==> Need to validate the sub-type inside the start Fragment Header
+    fn is_vcl_fragment(start_fragment_header: u8) -> bool {
+        let nalu_type = start_fragment_header & 0b00111111;
+        // Assuming `start_fragment_header` contains the original NAL unit type
+        match nalu_type {
+            0..=31 => true, // VCL NAL unit types in H.265 are from 0 to 31
+            _ => false,
+        }
+    }
+
     /// Checks NAL unit type ordering against rules of H.265.
     ///
     /// This doesn't precisely check every rule there but enough to diagnose some
@@ -790,9 +816,20 @@ impl Depacketizer {
                 | NaluType::StsaN
                 | NaluType::StsaR
                 | NaluType::RadlN
+                | NaluType::RadlR
+                | NaluType::RaslN
+                | NaluType::RaslR
                 | NaluType::IdrWRadl
-                | NaluType::IdrNLp => {
+                | NaluType::IdrNLp
+                | NaluType::CraNut
+                | NaluType::RsvIrapVcl22
+                | NaluType::RsvIrapVcl23 => {
                     seen_vcl = true; // Marks VCL NAL units
+                }
+                NaluType::RsvNvcl49 => {
+                    if nal.fu.is_some() && Self::is_vcl_fragment(nal.fu.unwrap()) {
+                        seen_vcl = true; // Marks VCL NAL units
+                    }
                 }
                 NaluType::PrefixSeiNut | NaluType::SuffixSeiNut => {
                     if seen_vcl {
@@ -825,6 +862,13 @@ impl Depacketizer {
         if !seen_vcl {
             errs.push_str("\n* Missing VCL");
         }
+    }
+
+    fn prepend_bytes(existing_data: &[u8], bytes_to_prepend: &[u8]) -> Vec<u8> {
+        let mut new_data = Vec::with_capacity(bytes_to_prepend.len() + existing_data.len());
+        new_data.extend_from_slice(bytes_to_prepend);
+        new_data.extend_from_slice(existing_data);
+        new_data
     }
 
     /// Logs information about each access unit.
@@ -896,6 +940,7 @@ impl Depacketizer {
                 }
                 NaluType::IdrNLp => is_random_access_point = true,
                 NaluType::IdrWRadl => is_random_access_point = true,
+                NaluType::RsvNvcl49 => is_random_access_point = nal.is_fu_idr(),
                 _ => {}
             }
             if nal.hdr.temporal_id() != 0 {
@@ -914,7 +959,13 @@ impl Depacketizer {
             let (high, low) = nal.hdr.bytes();
             data.push(high);
             data.push(low);
-            let mut actual_len = 1;
+            let mut actual_len = 2;
+
+            if nal.fu.is_some() {
+                data.push(nal.fu.unwrap());
+                actual_len += 1;
+            }
+
             for piece in nal_pieces {
                 data.extend_from_slice(&piece[..]);
                 actual_len += piece.len();
@@ -937,17 +988,20 @@ impl Depacketizer {
             self.parameters.as_ref(),
         ) {
             (Some(sps_nal), Some(pps_nal), old_ip) => {
+                let new_sps = Self::prepend_bytes(sps_nal, &[0, 0, 1]);
+                let sps_nalu =
+                    InternalParameters::find_nalu_by_type(&new_sps, parser::NaluType::SpsNut, 0)
+                        .unwrap();
+                let sps = parser.parse_sps(&sps_nalu).unwrap();
+                let sps_copy = sps.clone();
+
+                let new_pps = Self::prepend_bytes(pps_nal, &[0, 0, 1]);
                 let pps_nalu =
-                    InternalParameters::find_nalu_by_type(&pps_nal, parser::NaluType::PpsNut, 0)
+                    InternalParameters::find_nalu_by_type(&new_pps, parser::NaluType::PpsNut, 0)
                         .unwrap();
                 let pps = parser.parse_pps(&pps_nalu).unwrap();
                 let pps_copy = pps.clone();
 
-                let sps_nalu =
-                    InternalParameters::find_nalu_by_type(&sps_nal, parser::NaluType::SpsNut, 0)
-                        .unwrap();
-                let sps = parser.parse_sps(&sps_nalu).unwrap();
-                let sps_copy = sps.clone();
                 // TODO: could map this to a RtpPacketError more accurately.
                 // let seen_extra_trailing_data =
                 //     old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);

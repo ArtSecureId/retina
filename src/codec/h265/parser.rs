@@ -127,6 +127,66 @@ pub enum NaluType {
     RsvNvcl49 = 49,
 }
 
+impl TryFrom<u16> for NaluType {
+    type Error = String;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(NaluType::TrailN),
+            1 => Ok(NaluType::TrailR),
+            2 => Ok(NaluType::TsaN),
+            3 => Ok(NaluType::TsaR),
+            4 => Ok(NaluType::StsaN),
+            5 => Ok(NaluType::StsaR),
+            6 => Ok(NaluType::RadlN),
+            7 => Ok(NaluType::RadlR),
+            8 => Ok(NaluType::RaslN),
+            9 => Ok(NaluType::RaslR),
+            10 => Ok(NaluType::RsvVclN10),
+            11 => Ok(NaluType::RsvVclR11),
+            12 => Ok(NaluType::RsvVclN12),
+            13 => Ok(NaluType::RsvVclR13),
+            14 => Ok(NaluType::RsvVclN14),
+            15 => Ok(NaluType::RsvVclR15),
+            16 => Ok(NaluType::BlaWLp),
+            17 => Ok(NaluType::BlaWRadl),
+            18 => Ok(NaluType::BlaNLp),
+            19 => Ok(NaluType::IdrWRadl),
+            20 => Ok(NaluType::IdrNLp),
+            21 => Ok(NaluType::CraNut),
+            22 => Ok(NaluType::RsvIrapVcl22),
+            23 => Ok(NaluType::RsvIrapVcl23),
+            24 => Ok(NaluType::RsvVcl24),
+            25 => Ok(NaluType::RsvVcl25),
+            26 => Ok(NaluType::RsvVcl26),
+            27 => Ok(NaluType::RsvVcl27),
+            28 => Ok(NaluType::RsvVcl28),
+            29 => Ok(NaluType::RsvVcl29),
+            30 => Ok(NaluType::RsvVcl30),
+            31 => Ok(NaluType::RsvVcl31),
+            32 => Ok(NaluType::VpsNut),
+            33 => Ok(NaluType::SpsNut),
+            34 => Ok(NaluType::PpsNut),
+            35 => Ok(NaluType::AudNut),
+            36 => Ok(NaluType::EosNut),
+            37 => Ok(NaluType::EobNut),
+            38 => Ok(NaluType::FdNut),
+            39 => Ok(NaluType::PrefixSeiNut),
+            40 => Ok(NaluType::SuffixSeiNut),
+            41 => Ok(NaluType::RsvNvcl41),
+            42 => Ok(NaluType::RsvNvcl42),
+            43 => Ok(NaluType::RsvNvcl43),
+            44 => Ok(NaluType::RsvNvcl44),
+            45 => Ok(NaluType::RsvNvcl45),
+            46 => Ok(NaluType::RsvNvcl46),
+            47 => Ok(NaluType::RsvNvcl47),
+            48 => Ok(NaluType::RsvNvcl48),
+            49 => Ok(NaluType::RsvNvcl49),
+            _ => Err(format!("{} is not a valid value for NaluType", value)),
+        }
+    }
+}
+
 impl NaluType {
     pub fn value(&self) -> u8 {
         *self as u8
