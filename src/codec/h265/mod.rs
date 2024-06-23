@@ -14,7 +14,7 @@ use std::fmt::{self, Write};
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, log_enabled, trace};
-use parser::NaluType;
+use parser::{NaluType, Vps};
 
 use crate::codec::{CodecItem, ParametersRef, VideoFrame, VideoParameters};
 use crate::rtp::ReceivedPacket;
@@ -136,7 +136,7 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     /// The (single) VPS NAL.
-    vps_nal: Option<Bytes>,
+    vps_nal: Bytes,
 
     /// The (single) SEI NAL.
     sei_nal: Option<Bytes>,
@@ -241,7 +241,7 @@ impl InternalParameters {
         let vps_nalu = Self::find_nalu_by_type(&vps_nal, parser::NaluType::VpsNut, 0).unwrap();
         let vps = parser.parse_vps(&vps_nalu).unwrap();
 
-        Self::parse_sps_and_pps(&sps_nal, &sps_copy, &pps_nal, &pps_copy)
+        Self::parse_sps_pps_vps(&sps_nal, &sps_copy, &pps_nal, &pps_copy, &vps_nal, &vps)
     }
 
     pub fn find_nalu_by_type(
@@ -262,11 +262,13 @@ impl InternalParameters {
         None
     }
 
-    fn parse_sps_and_pps(
+    fn parse_sps_pps_vps(
         sps_nalu: &[u8],
         sps_decoded: &Sps,
         pps_nalu: &[u8],
         pps_decoded: &Pps,
+        vps_nalu: &[u8],
+        vps_decoded: &Vps,
     ) -> Result<InternalParameters, String> {
         let rfc6381_codec = format!(
             "avc1.{:02X}{:02X}{:02X}",
@@ -340,6 +342,8 @@ impl InternalParameters {
         let avc_decoder_config = avc_decoder_config.freeze();
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
+        let vps_nal = Bytes::copy_from_slice(vps_nalu);
+
         Ok(InternalParameters {
             generic_parameters: VideoParameters {
                 rfc6381_codec,
@@ -350,7 +354,7 @@ impl InternalParameters {
             },
             sps_nal,
             pps_nal,
-            vps_nal: None,
+            vps_nal,
             sei_nal: None,
         })
     }
@@ -910,6 +914,7 @@ impl Depacketizer {
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
+        let mut new_vps = None;
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
@@ -936,6 +941,16 @@ impl Depacketizer {
                         .unwrap_or(true)
                     {
                         new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
+                    }
+                }
+                NaluType::VpsNut => {
+                    if self
+                        .parameters
+                        .as_ref()
+                        .map(|p| !nal_matches(&p.vps_nal[..], nal.hdr, nal_pieces))
+                        .unwrap_or(true)
+                    {
+                        new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
                 NaluType::IdrNLp => is_random_access_point = true,
@@ -985,9 +1000,10 @@ impl Depacketizer {
         let has_new_parameters = match (
             new_sps.as_deref(),
             new_pps.as_deref(),
+            new_vps.as_deref(),
             self.parameters.as_ref(),
         ) {
-            (Some(sps_nal), Some(pps_nal), old_ip) => {
+            (Some(sps_nal), Some(pps_nal), Some(vps_nal), old_ip) => {
                 let new_sps = Self::prepend_bytes(sps_nal, &[0, 0, 1]);
                 let sps_nalu =
                     InternalParameters::find_nalu_by_type(&new_sps, parser::NaluType::SpsNut, 0)
@@ -1002,17 +1018,26 @@ impl Depacketizer {
                 let pps = parser.parse_pps(&pps_nalu).unwrap();
                 let pps_copy = pps.clone();
 
+                let new_vps = Self::prepend_bytes(vps_nal, &[0, 0, 1]);
+                let vps_nalu =
+                    InternalParameters::find_nalu_by_type(&new_vps, parser::NaluType::VpsNut, 0)
+                        .unwrap();
+                let vps = parser.parse_vps(&vps_nalu).unwrap();
+
                 // TODO: could map this to a RtpPacketError more accurately.
                 // let seen_extra_trailing_data =
                 //     old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal, &sps_copy, pps_nal, &pps_copy,
+                self.parameters = Some(InternalParameters::parse_sps_pps_vps(
+                    sps_nal, &sps_copy, pps_nal, &pps_copy, vps_nal, &vps,
                 )?);
                 true
             }
-            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
+            (Some(_), None, None, Some(old_ip))
+            | (None, Some(_), None, Some(old_ip))
+            | (None, None, Some(_), Some(old_ip)) => {
                 let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
                 let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
+                let vps_nal = new_vps.as_deref().unwrap_or(&old_ip.vps_nal);
 
                 let pps_nalu =
                     InternalParameters::find_nalu_by_type(&pps_nal, parser::NaluType::PpsNut, 0)
@@ -1026,9 +1051,14 @@ impl Depacketizer {
                 let sps = parser.parse_sps(&sps_nalu).unwrap();
                 let sps_copy = sps.clone();
 
+                let vps_nalu =
+                    InternalParameters::find_nalu_by_type(&vps_nal, parser::NaluType::VpsNut, 0)
+                        .unwrap();
+                let vps = parser.parse_vps(&vps_nalu).unwrap();
+
                 // TODO: as above, could map this to a RtpPacketError more accurately.
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal, &sps_copy, pps_nal, &pps_copy,
+                self.parameters = Some(InternalParameters::parse_sps_pps_vps(
+                    sps_nal, &sps_copy, pps_nal, &pps_copy, vps_nal, vps,
                 )?);
                 true
             }
