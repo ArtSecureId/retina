@@ -524,6 +524,7 @@ impl Depacketizer {
         };
         Ok(VideoFrame {
             has_new_parameters,
+            parameter_set: vec![],
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,

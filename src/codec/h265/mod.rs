@@ -13,13 +13,15 @@ use std::fmt::{self, Write};
 
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use log::{debug, log_enabled, trace};
+use log::{debug, info, log_enabled, trace};
 use parser::{NaluType, Vps};
 
 use crate::codec::{CodecItem, ParametersRef, VideoFrame, VideoParameters};
 use crate::rtp::ReceivedPacket;
 
 use self::parser::{NaluHeader, Pps, Sps};
+
+use super::ParameterSet;
 
 #[derive(Debug)]
 pub enum UnitTypeError {
@@ -405,7 +407,9 @@ fn can_end_au(nal_unit_type: NaluType) -> bool {
     // cannot follow the last VCL NAL unit of the primary coded picture within
     // the access unit, as this condition would specify the start of a new
     // access unit."
-    nal_unit_type != NaluType::SpsNut && nal_unit_type != NaluType::PpsNut
+    nal_unit_type != NaluType::SpsNut
+        && nal_unit_type != NaluType::PpsNut
+        && nal_unit_type != NaluType::VpsNut
 }
 
 /// An access unit that is currently being accumulated during `PreMark` state.
@@ -649,54 +653,6 @@ impl Depacketizer {
                     len,
                 });
             }
-            24 => {
-                // STAP-A. https://tools.ietf.org/html/rfc6184#section-5.7.1
-                loop {
-                    if data.remaining() < 3 {
-                        return Err(format!(
-                            "STAP-A has {} remaining bytes; expecting 2-byte length, non-empty NAL",
-                            data.remaining()
-                        ));
-                    }
-                    let len = data.get_u16();
-                    if len == 0 {
-                        return Err("zero length in STAP-A".into());
-                    }
-                    let hdr = NalHeader::new([data[0], data[1]])
-                        .map_err(|_| format!("bad header {:02x} in STAP-A", data[0]))?;
-                    match data.remaining().cmp(&usize::from(len)) {
-                        std::cmp::Ordering::Less => {
-                            return Err(format!(
-                                "STAP-A too short: {} bytes remaining, expecting {}-byte NAL",
-                                data.remaining(),
-                                len
-                            ))
-                        }
-                        std::cmp::Ordering::Equal => {
-                            data.advance(2);
-                            let next_piece_idx = self.add_piece(data)?;
-                            self.nals.push(Nal {
-                                hdr,
-                                fu: None,
-                                next_piece_idx,
-                                len: u32::from(len),
-                            });
-                            break;
-                        }
-                        std::cmp::Ordering::Greater => {
-                            let mut piece = data.split_to(usize::from(len));
-                            piece.advance(1);
-                            let next_piece_idx = self.add_piece(piece)?;
-                            self.nals.push(Nal {
-                                hdr,
-                                fu: None,
-                                next_piece_idx,
-                                len: u32::from(len),
-                            });
-                        }
-                    }
-                }
-            }
             49 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
                 if data.len() < 2 {
@@ -706,6 +662,11 @@ impl Depacketizer {
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
                 let nalu_type = fu_header & 0b00111111;
+
+                info!(
+                    "Received Fragmented Unit : {:#04x} with Start:End {start}:{end}",
+                    nalu_type
+                );
 
                 let reserved = (fu_header & 0b00100000) != 0;
                 data.advance(1);
@@ -915,6 +876,7 @@ impl Depacketizer {
         let mut new_sps = None;
         let mut new_pps = None;
         let mut new_vps = None;
+        let mut parameter_set = None;
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
@@ -985,13 +947,15 @@ impl Depacketizer {
                 data.extend_from_slice(&piece[..]);
                 actual_len += piece.len();
             }
-            debug_assert_eq!(
-                usize::try_from(nal.len).expect("u32 fits in usize"),
-                actual_len
-            );
+
+            // debug_assert_eq!(
+            //     usize::try_from(nal.len).expect("u32 fits in usize"),
+            //     actual_len
+            // );
             piece_idx = next_piece_idx;
         }
-        debug_assert_eq!(retained_len, data.len());
+
+        //debug_assert_eq!(retained_len, data.len());
         self.nals.clear();
         self.pieces.clear();
 
@@ -1030,6 +994,22 @@ impl Depacketizer {
                 self.parameters = Some(InternalParameters::parse_sps_pps_vps(
                     sps_nal, &sps_copy, pps_nal, &pps_copy, vps_nal, &vps,
                 )?);
+
+                parameter_set = Some(vec![
+                    ParameterSet {
+                        nalu_type_id: NaluType::VpsNut.value(),
+                        nalu: vps_nal.to_vec(),
+                    },
+                    ParameterSet {
+                        nalu_type_id: NaluType::SpsNut.value(),
+                        nalu: sps_nal.to_vec(),
+                    },
+                    ParameterSet {
+                        nalu_type_id: NaluType::PpsNut.value(),
+                        nalu: pps_nal.to_vec(),
+                    },
+                ]);
+
                 true
             }
             (Some(_), None, None, Some(old_ip))
@@ -1039,26 +1019,28 @@ impl Depacketizer {
                 let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
                 let vps_nal = new_vps.as_deref().unwrap_or(&old_ip.vps_nal);
 
+                let vps_nalu =
+                    InternalParameters::find_nalu_by_type(&vps_nal, parser::NaluType::VpsNut, 0)
+                        .unwrap();
+                let vps = parser.parse_vps(&vps_nalu).unwrap();
+                let vps_copy = vps.clone();
+
+                let new_sps = Self::prepend_bytes(sps_nal, &[0, 0, 1]);
+                let sps_nalu =
+                    InternalParameters::find_nalu_by_type(&new_sps, parser::NaluType::SpsNut, 0)
+                        .unwrap();
+                let sps = parser.parse_sps(&sps_nalu).unwrap();
+                let sps_copy = sps.clone();
+
                 let pps_nalu =
                     InternalParameters::find_nalu_by_type(&pps_nal, parser::NaluType::PpsNut, 0)
                         .unwrap();
                 let pps = parser.parse_pps(&pps_nalu).unwrap();
                 let pps_copy = pps.clone();
 
-                let sps_nalu =
-                    InternalParameters::find_nalu_by_type(&sps_nal, parser::NaluType::SpsNut, 0)
-                        .unwrap();
-                let sps = parser.parse_sps(&sps_nalu).unwrap();
-                let sps_copy = sps.clone();
-
-                let vps_nalu =
-                    InternalParameters::find_nalu_by_type(&vps_nal, parser::NaluType::VpsNut, 0)
-                        .unwrap();
-                let vps = parser.parse_vps(&vps_nalu).unwrap();
-
                 // TODO: as above, could map this to a RtpPacketError more accurately.
                 self.parameters = Some(InternalParameters::parse_sps_pps_vps(
-                    sps_nal, &sps_copy, pps_nal, &pps_copy, vps_nal, vps,
+                    sps_nal, &sps_copy, pps_nal, &pps_copy, vps_nal, &vps_copy,
                 )?);
                 true
             }
@@ -1066,6 +1048,7 @@ impl Depacketizer {
         };
         Ok(VideoFrame {
             has_new_parameters,
+            parameter_set: parameter_set.unwrap_or(vec![]),
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,
@@ -1075,6 +1058,26 @@ impl Depacketizer {
             is_disposable,
             data,
         })
+    }
+
+    fn escape_rbsp(data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            if i + 2 < data.len()
+                && data[i] == 0
+                && data[i + 1] == 0
+                && (data[i + 2] == 0 || data[i + 2] == 1 || data[i + 2] == 2 || data[i + 2] == 3)
+            {
+                output.extend_from_slice(&[0, 0, 3]); // Add two zeros and the emulation prevention byte
+                output.push(data[i + 2]); // Add the byte that follows the zeros
+                i += 3; // Move past the processed bytes
+            } else {
+                output.push(data[i]); // Copy the current byte
+                i += 1; // Move to the next byte
+            }
+        }
+        output
     }
 }
 

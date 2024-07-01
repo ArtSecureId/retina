@@ -477,6 +477,7 @@ impl Depacketizer {
                 start_ctx: metadata.start_ctx,
                 end_ctx: ctx,
                 has_new_parameters,
+                parameter_set: vec![],
                 loss,
                 timestamp,
                 stream_id,

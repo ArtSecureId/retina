@@ -304,6 +304,24 @@ impl MessageFrame {
     }
 }
 
+pub struct ParameterSet {
+    nalu_type_id: u8,
+    nalu: Vec<u8>,
+}
+
+impl ParameterSet {
+    /// Returns the nalu type id for the new video parameters.
+    ///
+    #[inline]
+    pub fn nalu_type_id(&self) -> u8 {
+        self.nalu_type_id
+    }
+    #[inline]
+    pub fn nalu(&self) -> &Vec<u8> {
+        &self.nalu
+    }
+}
+
 /// A single video frame (aka video sample or video access unit).
 ///
 /// Typically this is an encoded picture. It could also be a single field of an interlaced
@@ -318,6 +336,7 @@ pub struct VideoFrame {
     end_ctx: crate::PacketContext,
 
     has_new_parameters: bool,
+    parameter_set: Vec<ParameterSet>,
     loss: u16,
     timestamp: crate::Timestamp,
     stream_id: usize,
@@ -338,6 +357,14 @@ impl VideoFrame {
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
         self.has_new_parameters
+    }
+
+    /// Returns the list of new video parameters (VPS, SPS, PPS).
+    ///
+    /// The parameters can be obtained via [`crate::client::Stream::parameters`].
+    #[inline]
+    pub fn parameter_set(&self) -> &Vec<ParameterSet> {
+        &self.parameter_set
     }
 
     /// Returns the number of lost RTP packets before this video frame. See
