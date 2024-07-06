@@ -50,7 +50,6 @@ impl NalHeader {
     pub fn nal_unit_type(&self) -> NaluType {
         let nal_type = (self.0 >> 9) & 0b0000_0011_1111;
         let nalu_type = NaluType::try_from(nal_type);
-        log::info!("Received Nalu Type {:?}", nalu_type);
         match nal_type {
             0 => NaluType::TrailN,
             1 => NaluType::TrailR,
@@ -362,7 +361,7 @@ impl InternalParameters {
     }
 }
 
-/// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..data]`.
+/// Returns true if the bytes of `nal` equal the bytes of `[hdr, ..data]`.
 fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
     let nal_head = NalHeader::new([nal[0], nal[1]]);
     if nal.is_empty() || nal_head.unwrap().0 != u16::from(hdr.0) {
@@ -410,6 +409,7 @@ fn can_end_au(nal_unit_type: NaluType) -> bool {
     nal_unit_type != NaluType::SpsNut
         && nal_unit_type != NaluType::PpsNut
         && nal_unit_type != NaluType::VpsNut
+        && nal_unit_type != NaluType::PrefixSeiNut
 }
 
 /// An access unit that is currently being accumulated during `PreMark` state.
@@ -549,7 +549,7 @@ impl Depacketizer {
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
                     let loss = pkt.loss();
-                    if loss > 0 {
+                    if loss > 10 {
                         self.nals.clear();
                         self.pieces.clear();
                         if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
@@ -876,6 +876,7 @@ impl Depacketizer {
         let mut new_sps = None;
         let mut new_pps = None;
         let mut new_vps = None;
+        let mut new_sei = None;
         let mut parameter_set = None;
 
         if log_enabled!(log::Level::Debug) {
@@ -884,6 +885,7 @@ impl Depacketizer {
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            log::info!("Received Nalu Type {:?}", nal.hdr.nal_unit_type());
             match nal.hdr.nal_unit_type() {
                 NaluType::SpsNut => {
                     if self
@@ -915,6 +917,9 @@ impl Depacketizer {
                         new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
+                NaluType::PrefixSeiNut => {
+                    new_sei = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
+                }
                 NaluType::IdrNLp => is_random_access_point = true,
                 NaluType::IdrWRadl => is_random_access_point = true,
                 NaluType::RsvNvcl49 => is_random_access_point = nal.is_fu_idr(),
@@ -932,22 +937,32 @@ impl Depacketizer {
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            data.extend_from_slice(&nal.len.to_be_bytes()[..]);
-            let (high, low) = nal.hdr.bytes();
-            data.push(high);
-            data.push(low);
-            let mut actual_len = 2;
 
-            if nal.fu.is_some() {
-                data.push(nal.fu.unwrap());
-                actual_len += 1;
+            if nal.hdr.nal_unit_type().is_idr() || nal.fu.is_some() {
+                let (mut high, low) = nal.hdr.bytes();
+
+                if nal.fu.is_some() {
+                    let mask: u8 = 0b10000001;
+                    high = high & mask;
+                    let nalu_type = nal.fu.unwrap() << 1;
+                    high = high | nalu_type;
+                    let len = nal.len - 1;
+                    data.extend_from_slice(&len.to_be_bytes()[..]);
+                    //data.push(nal.fu.unwrap());
+                    //actual_len += 1;
+                } else {
+                    data.extend_from_slice(&nal.len.to_be_bytes()[..]);
+                }
+
+                data.push(high);
+                data.push(low);
+                let mut actual_len = 2;
+
+                for piece in nal_pieces {
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
             }
-
-            for piece in nal_pieces {
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
-            }
-
             // debug_assert_eq!(
             //     usize::try_from(nal.len).expect("u32 fits in usize"),
             //     actual_len
@@ -1007,6 +1022,10 @@ impl Depacketizer {
                     ParameterSet {
                         nalu_type_id: NaluType::PpsNut.value(),
                         nalu: pps_nal.to_vec(),
+                    },
+                    ParameterSet {
+                        nalu_type_id: NaluType::PrefixSeiNut.value(),
+                        nalu: new_sei.unwrap().to_vec(),
                     },
                 ]);
 

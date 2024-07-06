@@ -165,6 +165,7 @@ impl InorderParser {
         let ssrc = raw.ssrc();
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
+
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
             note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
@@ -201,12 +202,40 @@ impl InorderParser {
                 });
             } else {
                 log::info!(
-                    "Skipping out-of-order seq={} when expecting ssrc={:08x?} seq={:?}",
+                    "NOT Skipping BUT Skipping out-of-order seq={} when expecting ssrc={:08x?} seq={:?}",
                     sequence_number,
                     self.ssrc,
                     self.seq,
                 );
-                return Ok(None);
+
+                let timestamp = match timeline.advance_to(raw.timestamp()) {
+                    Ok(ts) => ts,
+                    Err(description) => bail!(ErrorInt::RtpPacketError {
+                        conn_ctx: *conn_ctx,
+                        pkt_ctx: *pkt_ctx,
+                        stream_ctx: stream_ctx.to_owned(),
+                        stream_id,
+                        ssrc,
+                        sequence_number,
+                        description,
+                    }),
+                };
+                self.seq = Some(Seq {
+                    init: self
+                        .seq
+                        .map(|s| s.init)
+                        .unwrap_or(InitialExpectation::RtpPacket),
+                    next: sequence_number.wrapping_add(1),
+                });
+                self.seen_rtp_packets += 1;
+                return Ok(Some(PacketItem::Rtp(ReceivedPacket {
+                    ctx: *pkt_ctx,
+                    stream_id,
+                    timestamp,
+                    raw,
+                    payload_range,
+                    loss: 0,
+                })));
             }
         }
         let timestamp = match timeline.advance_to(raw.timestamp()) {
