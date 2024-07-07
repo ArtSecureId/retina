@@ -938,7 +938,10 @@ impl Depacketizer {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
 
-            if nal.hdr.nal_unit_type().is_idr() || nal.fu.is_some() {
+            if nal.hdr.nal_unit_type().is_idr()
+                || nal.hdr.nal_unit_type().value() < 31
+                || nal.fu.is_some()
+            {
                 let (mut high, low) = nal.hdr.bytes();
 
                 if nal.fu.is_some() {
